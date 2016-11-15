@@ -1,13 +1,10 @@
 package com.example
 
-import org.apache.spark.mllib.classification.{LogisticRegressionWithSGD, LogisticRegressionWithLBFGS, NaiveBayes}
-import org.apache.spark.ml.feature.{StopWordsRemover, HashingTF, Tokenizer}
-import org.apache.spark.ml.linalg.{SparseVector, Vector}
-import org.apache.spark.mllib.linalg.Vectors
-import org.apache.spark.mllib.regression.LabeledPoint
-import org.apache.spark.mllib.tree.DecisionTree
-import org.apache.spark.mllib.tree.configuration.Algo
-import org.apache.spark.mllib.tree.impurity.{Variance, Gini, Entropy}
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.classification.NaiveBayes
+import org.apache.spark.ml.evaluation.BinaryClassificationEvaluator
+import org.apache.spark.ml.feature.{HashingTF, StopWordsRemover, Tokenizer}
+import org.apache.spark.ml.tuning.{CrossValidator, ParamGridBuilder}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
 import org.apache.spark.{SparkConf, SparkContext}
@@ -19,40 +16,74 @@ object Main {
     val sc = new SparkContext(conf)
     val spark = SparkSession.builder().config(conf).getOrCreate()
 
-    import spark.implicits._
-
 
     val df = spark.read.csv(logFile)
 
+    val toDouble = udf[Double, String]( _.toDouble)
     val mlData = df.select("_c0", "_c1").toDF("text", "label")
 
-    val wordsData = new Tokenizer().setInputCol("text").setOutputCol("words").transform(mlData)
-    val cleaned = new StopWordsRemover().setInputCol("words").setOutputCol("cleaned").transform(wordsData)
-    cleaned.show(30)
-    val hashTF = new HashingTF().setInputCol("cleaned").setOutputCol("features").setNumFeatures(11000)
-    val featureData = hashTF.transform(cleaned)
+    val data_all = mlData.withColumn("label", toDouble(mlData("label"))).select("text", "label").cache()
 
-    val toDouble = udf[Double, String]( _.toDouble)
-    val data_all = featureData.withColumn("label", toDouble(featureData("label"))).select("features", "label")
+    val tokenizer = new Tokenizer().setInputCol("text").setOutputCol("words")
+    val cleaner = new StopWordsRemover().setInputCol(tokenizer.getOutputCol).setOutputCol("cleaned")
+    val hashTF = new HashingTF().setInputCol(cleaner.getOutputCol).setOutputCol("features").setNumFeatures(11000)
+
+    val naiveBayes = new NaiveBayes().setSmoothing(7)
+
+    val pipeline = new Pipeline().setStages(Array(tokenizer, cleaner, hashTF, naiveBayes))
 
 
-    val data_points = data_all.map(row => LabeledPoint(row.getDouble(1), Vectors.dense(row.getAs[Vector](0).toArray))).rdd
-    val splits = data_points.randomSplit(Array(0.7, 0.3))
+    val paramgrid = new ParamGridBuilder()
+      .addGrid(hashTF.numFeatures, Array(1000, 5000, 10000, 11000, 12000, 13000))
+      .addGrid(naiveBayes.smoothing, Array(1.0,2,3,4,5,6,7,8,9,10))
+      .build()
+
+
+    val cv = new CrossValidator()
+      .setEstimator(pipeline)
+      .setEvaluator(new BinaryClassificationEvaluator)
+      .setEstimatorParamMaps(paramgrid)
+      .setNumFolds(10)
+
+    val splits = data_all.randomSplit(Array(0.7, 0.3))
     val (data_training, data_testing) = (splits(0), splits(1))
-    data_training.cache()
+
+    val cvModel = cv.fit(data_all)
+
+    val pal = cvModel.transform(data_testing)
+      .select("prediction", "label")
+      .collect()
+
+      val accuracy = 1.0 * pal.count(r => r.getDouble(0) == r.getDouble(1)) / data_testing.count()
+
+//    val predictionAndLabel = data_testing.map{ point =>
+//            (model.predict(point.features), point.label)
+//          }
+//
+//          val accuracy = 1.0 * predictionAndLabel.filter(x => x._1 == x._2).count() / data_testing.count()
+//
+    println("accuracy: " + accuracy)
+//
+//
+//    cvModel.save("/Users/andrey/dev/cvModel")
+
+    //val data_points = data_all.map(row => LabeledPoint(row.getDouble(1), Vectors.dense(row.getAs[Vector](0).toArray))).rdd
+    //val splits = data_points.randomSplit(Array(0.7, 0.3))
+    //val (data_training, data_testing) = (splits(0), splits(1))
+    //data_training.cache()
 
 
-    val model = NaiveBayes.train(data_training, 7)   //0.7277
+    //val model = NaiveBayes.train(data_training, 7)   //0.7277
 
     //val model = DecisionTree.train(data_training, Algo.Classification, Entropy.instance, 3)
    // val model = new LogisticRegressionWithLBFGS().setNumClasses(2).run(data_training)
-    val predictionAndLabel = data_testing.map{ point =>
-      (model.predict(point.features), point.label)
-    }
-
-    val accuracy = 1.0 * predictionAndLabel.filter(x => x._1 == x._2).count() / data_testing.count()
-
-    println("accuracy: " + accuracy)
+//    val predictionAndLabel = data_testing.map{ point =>
+//      (model.predict(point.features), point.label)
+//    }
+//
+//    val accuracy = 1.0 * predictionAndLabel.filter(x => x._1 == x._2).count() / data_testing.count()
+//
+//    println("accuracy: " + accuracy)
 
     //model.save(sc, "/Users/andrey/dev/zp3model")
   }
